@@ -1,0 +1,99 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Phone-friendly upload: if you uploaded PriorityMatrix.zip through the GitHub website,
+      # it is extracted and committed for you (workflow files are left untouched).
+      - name: Unpack PriorityMatrix.zip (if present)
+        if: hashFiles('PriorityMatrix.zip') != ''
+        run: |
+          unzip -o -q PriorityMatrix.zip -d .
+          rm -f PriorityMatrix.zip
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- . ':(exclude).github'
+          git commit -m "Unpack project from PriorityMatrix.zip" || echo "Nothing to commit"
+          git push || echo "::warning::Could not push the unpacked files; the build continues anyway."
+
+      - name: Check project files
+        id: project
+        run: |
+          if [ -f gradlew ] && [ -f app/build.gradle.kts ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Project files not found yet. Upload PriorityMatrix.zip (or the project files) to this repository."
+          fi
+
+      - name: Set up JDK 17
+        if: steps.project.outputs.ok == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: steps.project.outputs.ok == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        if: steps.project.outputs.ok == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        if: steps.project.outputs.ok == 'true'
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK artifact
+        if: steps.project.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PriorityMatrix-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Also publish the APK on the repository's Releases page: on a phone you can tap and
+      # install it directly instead of downloading and unzipping an artifact.
+      - name: Publish "latest-debug" release
+        if: steps.project.outputs.ok == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk PriorityMatrix-debug.apk
+          gh release delete latest-debug --yes --cleanup-tag || true
+          gh release create latest-debug PriorityMatrix-debug.apk \
+            --prerelease \
+            --title "Priority Matrix – latest debug build" \
+            --notes "Built from ${GITHUB_SHA::7} on $(date -u '+%Y-%m-%d %H:%M UTC'). Download PriorityMatrix-debug.apk on your phone and open it to install." \
+            --target "${GITHUB_SHA}"
+
+      - name: Run unit tests
+        if: steps.project.outputs.ok == 'true'
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Upload test reports
+        if: always() && steps.project.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
